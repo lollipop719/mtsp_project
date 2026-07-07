@@ -1,0 +1,13 @@
+{
+  "problem": "Centralized 3-drone multi-depot MinMax mTSP",
+  "num_drones": 3,
+  "num_tasks": 15,
+  "solver": "OR-Tools",
+  "ortools_time_limit_s": 1,
+  "action_encoding": "Each row is [drone_id, task_id]. Routes are interleaved by route position, then drone index.",
+  "splits": {
+    "train": "data/mtsp_3drones_15tasks_train.npz",
+    "val": "data/mtsp_3drones_15tasks_val.npz",
+    "test": "data/mtsp_3drones_15tasks_test.npz"
+  }
+}
