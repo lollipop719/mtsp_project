@@ -9,17 +9,12 @@ from pathlib import Path
 
 import numpy as np
 
-from ros2.mission_config import (
-    DRONES,
-    PROJECT_ROOT,
-    planner_to_gazebo_enu,
-)
+from ros2.mission_config import PROJECT_ROOT, planner_to_gazebo_enu
 
 
 def make_project_path(path: Path) -> Path:
     if path.is_absolute():
         return path
-
     return PROJECT_ROOT / path
 
 
@@ -47,26 +42,20 @@ def run_command(
 
 
 def detect_world_create_service() -> str:
-    result = run_command(
-        ["gz", "service", "-l"],
-    )
-
-    services = result.stdout.splitlines()
+    result = run_command(["gz", "service", "-l"])
 
     candidates = [
         service.strip()
-        for service in services
+        for service in result.stdout.splitlines()
         if service.strip().startswith("/world/")
         and service.strip().endswith("/create")
     ]
 
     if not candidates:
         raise RuntimeError(
-            "Could not find a Gazebo create service. "
-            "Is Gazebo currently running?"
+            "Could not find a Gazebo create service. Is Gazebo running?"
         )
 
-    # Usually there is only one world.
     return candidates[0]
 
 
@@ -138,34 +127,6 @@ def box_model_sdf(
 """
 
 
-def cylinder_model_sdf(
-    name: str,
-    radius: float,
-    length: float,
-    color: tuple[float, float, float],
-) -> str:
-    red, green, blue = color
-
-    return f"""
-<sdf version="1.9">
-  <model name="{name}">
-    <static>true</static>
-    <link name="link">
-      <visual name="visual">
-        <geometry>
-          <cylinder>
-            <radius>{radius}</radius>
-            <length>{length}</length>
-          </cylinder>
-        </geometry>
-        {material_sdf(red, green, blue)}
-      </visual>
-    </link>
-  </model>
-</sdf>
-"""
-
-
 def spawn_sdf_model(
     *,
     create_service: str,
@@ -177,18 +138,26 @@ def spawn_sdf_model(
     x, y, z = position
     roll, pitch, yaw = rpy
 
+    cr = math.cos(roll / 2.0)
+    sr = math.sin(roll / 2.0)
+    cp = math.cos(pitch / 2.0)
+    sp = math.sin(pitch / 2.0)
+    cy = math.cos(yaw / 2.0)
+    sy = math.sin(yaw / 2.0)
+
+    qx = sr * cp * cy - cr * sp * sy
+    qy = cr * sp * cy + sr * cp * sy
+    qz = cr * cp * sy - sr * sp * cy
+    qw = cr * cp * cy + sr * sp * sy
+
     request = (
         f'name: "{name}", '
         f'allow_renaming: true, '
         f'sdf: {json.dumps(sdf)}, '
         f'pose: {{ '
         f'position: {{ x: {x:.6f}, y: {y:.6f}, z: {z:.6f} }}, '
-        f'orientation: {{ '
-        f'x: {math.sin(roll / 2.0):.8f}, '
-        f'y: {math.sin(pitch / 2.0):.8f}, '
-        f'z: {math.sin(yaw / 2.0):.8f}, '
-        f'w: {math.cos(yaw / 2.0) * math.cos(pitch / 2.0) * math.cos(roll / 2.0):.8f} '
-        f'}} '
+        f'orientation: {{ x: {qx:.8f}, y: {qy:.8f}, '
+        f'z: {qz:.8f}, w: {qw:.8f} }} '
         f'}}'
     )
 
@@ -217,23 +186,26 @@ def spawn_sdf_model(
         raise RuntimeError("Failed to spawn Gazebo model.")
 
 
-def drone_color(index: int) -> tuple[float, float, float]:
-    if index == 0:
-        return 1.0, 0.05, 0.05
-    if index == 1:
-        return 0.05, 1.0, 0.05
+def agent_color(index: int) -> tuple[float, float, float]:
+    colors = [
+        (1.0, 0.05, 0.05),
+        (0.05, 1.0, 0.05),
+        (0.05, 0.25, 1.0),
+        (1.0, 0.65, 0.05),
+        (0.65, 0.05, 1.0),
+        (0.05, 1.0, 1.0),
+        (1.0, 0.05, 0.6),
+        (0.5, 0.5, 0.5),
+    ]
+    return colors[index % len(colors)]
 
-    return 0.05, 0.25, 1.0
 
-
-def assigned_drone_by_task(
-    routes: list[list[int]],
-) -> dict[int, int]:
+def assigned_agent_by_task(routes: list[list[int]]) -> dict[int, int]:
     mapping: dict[int, int] = {}
 
-    for drone_index, route in enumerate(routes):
+    for agent_index, route in enumerate(routes):
         for task_id in route:
-            mapping[int(task_id)] = drone_index
+            mapping[int(task_id)] = agent_index
 
     return mapping
 
@@ -246,12 +218,6 @@ def spawn_route_segment(
     end_xy: np.ndarray,
     color: tuple[float, float, float],
 ) -> None:
-    """
-    Spawn one route segment as a thin horizontal box.
-
-    This is more stable than using cylinders, because the box's local
-    x-axis naturally represents the segment direction.
-    """
     start = np.asarray(start_xy, dtype=np.float64)
     end = np.asarray(end_xy, dtype=np.float64)
 
@@ -285,7 +251,7 @@ def spawn_route_segment(
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Spawn static learned mTSP visuals into Gazebo."
+        description="Spawn static mTSP visuals into Gazebo."
     )
 
     parser.add_argument(
@@ -301,7 +267,6 @@ def main() -> None:
         "--prefix",
         type=str,
         default=None,
-        help="Name prefix for spawned Gazebo models.",
     )
 
     args = parser.parse_args()
@@ -309,9 +274,7 @@ def main() -> None:
     mission_path = make_project_path(args.mission)
 
     if not mission_path.exists():
-        raise FileNotFoundError(
-            f"Mission JSON not found: {mission_path}"
-        )
+        raise FileNotFoundError(f"Mission JSON not found: {mission_path}")
 
     if args.prefix is None:
         args.prefix = f"mtsp_{int(time.time())}"
@@ -339,18 +302,12 @@ def main() -> None:
     print(f"Using Gazebo create service: {create_service}")
     print(f"Spawn prefix: {args.prefix}")
 
-    task_to_drone = assigned_drone_by_task(routes)
+    task_to_agent = assigned_agent_by_task(routes)
 
-    # -------------------------
-    # Depot cubes
-    # -------------------------
-    for drone_index, spec in enumerate(DRONES):
-        depot_enu = planner_to_gazebo_enu(
-            depots_xy[spec.depot_index]
-        )
-
-        color = drone_color(drone_index)
-        name = f"{args.prefix}_depot_D{drone_index + 1}"
+    for agent_index, depot_xy in enumerate(depots_xy):
+        depot_enu = planner_to_gazebo_enu(depot_xy)
+        color = agent_color(agent_index)
+        name = f"{args.prefix}_depot_D{agent_index + 1}"
 
         spawn_sdf_model(
             create_service=create_service,
@@ -367,14 +324,10 @@ def main() -> None:
             ),
         )
 
-    # -------------------------
-    # Task spheres
-    # -------------------------
     for task_id, task_xy in enumerate(tasks_xy):
         task_enu = planner_to_gazebo_enu(task_xy)
-        assigned_drone = task_to_drone[task_id]
-        color = drone_color(assigned_drone)
-
+        assigned_agent = task_to_agent[task_id]
+        color = agent_color(assigned_agent)
         name = f"{args.prefix}_task_T{task_id + 1}"
 
         spawn_sdf_model(
@@ -392,23 +345,14 @@ def main() -> None:
             ),
         )
 
-    # -------------------------
-    # Route cylinders
-    # -------------------------
-    for drone_index, spec in enumerate(DRONES):
-        route = routes[spec.depot_index]
-        color = drone_color(drone_index)
-
-        depot_enu = planner_to_gazebo_enu(
-            depots_xy[spec.depot_index]
-        )
+    for agent_index, route in enumerate(routes):
+        color = agent_color(agent_index)
+        depot_enu = planner_to_gazebo_enu(depots_xy[agent_index])
 
         points = [depot_enu]
 
         for task_id in route:
-            points.append(
-                planner_to_gazebo_enu(tasks_xy[task_id])
-            )
+            points.append(planner_to_gazebo_enu(tasks_xy[task_id]))
 
         points.append(depot_enu)
 
@@ -416,7 +360,7 @@ def main() -> None:
             spawn_route_segment(
                 create_service=create_service,
                 name=(
-                    f"{args.prefix}_route_D{drone_index + 1}_"
+                    f"{args.prefix}_route_D{agent_index + 1}_"
                     f"S{segment_index + 1}"
                 ),
                 start_xy=points[segment_index],
@@ -426,11 +370,8 @@ def main() -> None:
 
     print("Done.")
     print(
-        "Gazebo should now show colored depot cubes, "
-        "task spheres, and route line cylinders."
-    )
-    print(
-        "Labels are still easier in RViz; Gazebo labels can be added later."
+        "Gazebo should now show depot cubes, task spheres, and route strips "
+        "for all agents."
     )
 
 

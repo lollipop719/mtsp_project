@@ -1,0 +1,436 @@
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import shlex
+import signal
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(PROJECT_ROOT))
+
+import numpy as np
+
+from ros2.mission_config import planner_to_gazebo_enu
+
+
+PX4_ROOT = Path("/workspace/PX4-Autopilot")
+
+
+class ManagedProcess:
+    def __init__(
+        self,
+        name: str,
+        command: list[str],
+        cwd: Path | None = None,
+        env: dict[str, str] | None = None,
+        log_path: Path | None = None,
+    ) -> None:
+        self.name = name
+        self.command = command
+        self.cwd = cwd
+        self.env = env
+        self.log_path = log_path
+        self.log_file = None
+        self.process: subprocess.Popen | None = None
+
+    def start(self) -> None:
+        print()
+        print("=" * 80)
+        print(f"Starting {self.name}")
+        print("Command:")
+        print(" ".join(shlex.quote(part) for part in self.command))
+
+        stdout_target = subprocess.DEVNULL
+
+        if self.log_path is not None:
+            self.log_path.parent.mkdir(parents=True, exist_ok=True)
+            self.log_file = self.log_path.open("w", encoding="utf-8")
+            stdout_target = self.log_file
+            print(f"Log: {self.log_path}")
+
+        print("=" * 80)
+
+        self.process = subprocess.Popen(
+            self.command,
+            cwd=str(self.cwd) if self.cwd is not None else None,
+            env=self.env,
+            stdin=subprocess.DEVNULL,
+            stdout=stdout_target,
+            stderr=subprocess.STDOUT,
+            preexec_fn=os.setsid,
+        )
+
+    def stop(self) -> None:
+        if self.process is None:
+            self._close_log_file()
+            return
+
+        if self.process.poll() is not None:
+            self._close_log_file()
+            return
+
+        print(f"Stopping {self.name}...")
+
+        try:
+            os.killpg(os.getpgid(self.process.pid), signal.SIGINT)
+            self.process.wait(timeout=5)
+        except Exception:
+            try:
+                os.killpg(os.getpgid(self.process.pid), signal.SIGTERM)
+                self.process.wait(timeout=5)
+            except Exception:
+                try:
+                    os.killpg(os.getpgid(self.process.pid), signal.SIGKILL)
+                except Exception:
+                    pass
+
+        self._close_log_file()
+
+    def _close_log_file(self) -> None:
+        if self.log_file is not None:
+            self.log_file.close()
+            self.log_file = None
+
+
+def run_blocking(command: list[str], cwd: Path | None = None) -> int:
+    print()
+    print("=" * 80)
+    print("Running:")
+    print(" ".join(shlex.quote(part) for part in command))
+    print("=" * 80)
+
+    completed = subprocess.run(
+        command,
+        cwd=str(cwd) if cwd is not None else None,
+    )
+
+    return completed.returncode
+
+
+def make_project_path(path: Path) -> Path:
+    if path.is_absolute():
+        return path
+    return PROJECT_ROOT / path
+
+
+def load_depot_poses_from_mission(mission_path: Path) -> list[str]:
+    with mission_path.open("r", encoding="utf-8") as file:
+        mission = json.load(file)
+
+    planner = mission["planner"]
+
+    depots_xy = np.asarray(
+        planner["depots_xy"],
+        dtype=np.float64,
+    )
+
+    poses: list[str] = []
+
+    for depot_xy in depots_xy:
+        depot_enu = planner_to_gazebo_enu(depot_xy)
+
+        east = float(depot_enu[0])
+        north = float(depot_enu[1])
+
+        poses.append(f"{east:.3f},{north:.3f},0,0,0,0")
+
+    return poses
+
+
+def wait_for_gazebo_create_service(timeout_s: float) -> bool:
+    started_at = time.monotonic()
+
+    while time.monotonic() - started_at < timeout_s:
+        result = subprocess.run(
+            ["gz", "service", "-l"],
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+
+        if result.returncode == 0:
+            for service in result.stdout.splitlines():
+                service = service.strip()
+                if service.startswith("/world/") and service.endswith("/create"):
+                    print(f"Gazebo create service detected: {service}")
+                    return True
+
+        time.sleep(1.0)
+
+    return False
+
+
+def make_px4_process(
+    *,
+    instance_id: int,
+    pose: str,
+    standalone: bool,
+    log_path: Path | None,
+) -> ManagedProcess:
+    env = os.environ.copy()
+    env["PX4_SYS_AUTOSTART"] = "4001"
+    env["PX4_SIM_MODEL"] = "gz_x500"
+    env["PX4_GZ_MODEL_POSE"] = pose
+
+    if standalone:
+        env["PX4_GZ_STANDALONE"] = "1"
+    else:
+        env.pop("PX4_GZ_STANDALONE", None)
+
+    command = [
+        str(PX4_ROOT / "build" / "px4_sitl_default" / "bin" / "px4"),
+        "-i",
+        str(instance_id),
+    ]
+
+    return ManagedProcess(
+        name=f"PX4 drone instance {instance_id}",
+        command=command,
+        cwd=PX4_ROOT,
+        env=env,
+        log_path=log_path,
+    )
+
+
+def clean_existing_sim_processes() -> None:
+    print("Cleaning old simulation processes...")
+
+    commands = [
+        ["pkill", "-f", "MicroXRCEAgent"],
+        ["pkill", "-f", "px4"],
+        ["pkill", "-f", "gz sim"],
+        ["pkill", "-f", "gz gui"],
+    ]
+
+    for command in commands:
+        subprocess.run(
+            command,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+
+    time.sleep(2.0)
+
+
+def wait_for_px4_ros_topics(
+    *,
+    num_drones: int,
+    timeout_s: float,
+) -> bool:
+    required_topics = [
+        f"/px4_{index}/fmu/out/vehicle_local_position_v1"
+        for index in range(1, num_drones + 1)
+    ]
+
+    started_at = time.monotonic()
+
+    while time.monotonic() - started_at < timeout_s:
+        result = subprocess.run(
+            ["ros2", "topic", "list"],
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+
+        if result.returncode == 0:
+            available = set(result.stdout.splitlines())
+
+            missing = [
+                topic
+                for topic in required_topics
+                if topic not in available
+            ]
+
+            if not missing:
+                print("All PX4 local-position ROS 2 topics detected.")
+                return True
+
+            print(f"Waiting for PX4 ROS 2 topics. Missing: {missing}")
+
+        time.sleep(2.0)
+
+    return False
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(
+        description="Run a variable-drone mTSP Gazebo pipeline."
+    )
+
+    parser.add_argument(
+        "--mission",
+        type=Path,
+        required=True,
+    )
+
+    parser.add_argument("--execute", action="store_true")
+    parser.add_argument("--hover-only", action="store_true")
+    parser.add_argument("--spawn-visuals", action="store_true")
+    parser.add_argument("--clean-start", action="store_true")
+
+    parser.add_argument("--mission-timeout-s", type=float, default=300.0)
+    parser.add_argument("--waypoint-tolerance", type=float, default=0.25)
+    parser.add_argument("--waypoint-dwell-s", type=float, default=1.5)
+    parser.add_argument("--startup-wait-s", type=float, default=25.0)
+    parser.add_argument("--post-visuals-wait-s", type=float, default=5.0)
+
+    parser.add_argument(
+        "--executor-module",
+        type=str,
+        default="ros2.variable_px4_executor",
+    )
+
+    parser.add_argument(
+        "--log-dir",
+        type=Path,
+        default=Path("outputs/sim_logs"),
+    )
+
+    args = parser.parse_args()
+
+    mission_path = make_project_path(args.mission)
+
+    if not mission_path.exists():
+        raise FileNotFoundError(f"Mission file not found: {mission_path}")
+
+    log_dir = make_project_path(args.log_dir)
+    log_dir.mkdir(parents=True, exist_ok=True)
+
+    if args.clean_start:
+        clean_existing_sim_processes()
+
+    depot_poses = load_depot_poses_from_mission(mission_path)
+    num_drones = len(depot_poses)
+
+    print()
+    print("Mission:")
+    print(f"  {mission_path}")
+    print("Log directory:")
+    print(f"  {log_dir}")
+    print(f"Detected number of drones: {num_drones}")
+    print()
+    print("Detected drone depot poses:")
+
+    for index, pose in enumerate(depot_poses, start=1):
+        print(f"  Drone {index}: PX4_GZ_MODEL_POSE={pose}")
+
+    processes: list[ManagedProcess] = []
+
+    try:
+        agent = ManagedProcess(
+            name="MicroXRCEAgent",
+            command=["MicroXRCEAgent", "udp4", "-p", "8888"],
+            log_path=log_dir / "micro_xrce_agent.log",
+        )
+        agent.start()
+        processes.append(agent)
+
+        time.sleep(2.0)
+
+        for drone_index, pose in enumerate(depot_poses, start=1):
+            px4_process = make_px4_process(
+                instance_id=drone_index,
+                pose=pose,
+                standalone=(drone_index != 1),
+                log_path=log_dir / f"px4_instance_{drone_index}.log",
+            )
+
+            px4_process.start()
+            processes.append(px4_process)
+
+            if drone_index == 1:
+                time.sleep(5.0)
+            else:
+                time.sleep(2.0)
+
+        print()
+        print(f"Waiting {args.startup_wait_s:.1f} s for PX4/Gazebo startup...")
+        time.sleep(args.startup_wait_s)
+
+        if not wait_for_px4_ros_topics(
+            num_drones=num_drones,
+            timeout_s=90.0,
+        ):
+            raise RuntimeError(
+                "Not all PX4 ROS 2 telemetry topics appeared. "
+                "Aborting before executor starts."
+            )
+
+        if args.spawn_visuals:
+            print()
+            print("Waiting for Gazebo create service before spawning visuals...")
+
+            if wait_for_gazebo_create_service(timeout_s=30.0):
+                result = run_blocking(
+                    [
+                        sys.executable,
+                        "-m",
+                        "ros2.spawn_gazebo_markers",
+                        "--mission",
+                        str(mission_path),
+                    ],
+                    cwd=PROJECT_ROOT,
+                )
+
+                if result != 0:
+                    raise RuntimeError("Gazebo visual spawning failed.")
+
+                print(
+                    f"Waiting {args.post_visuals_wait_s:.1f} s after spawning visuals..."
+                )
+                time.sleep(args.post_visuals_wait_s)
+            else:
+                print("Gazebo create service was not detected. Skipping visuals.")
+
+        executor_command = [
+            sys.executable,
+            "-m",
+            args.executor_module,
+            "--mission",
+            str(mission_path),
+            "--mission-timeout-s",
+            str(args.mission_timeout_s),
+            "--waypoint-tolerance",
+            str(args.waypoint_tolerance),
+            "--waypoint-dwell-s",
+            str(args.waypoint_dwell_s),
+        ]
+
+        if args.execute:
+            executor_command.append("--execute")
+
+        if args.hover_only:
+            executor_command.append("--hover-only")
+
+        result = run_blocking(
+            executor_command,
+            cwd=PROJECT_ROOT,
+        )
+
+        if result != 0:
+            raise RuntimeError("Mission executor failed.")
+
+        print()
+        print("Pipeline finished successfully.")
+
+    except KeyboardInterrupt:
+        print()
+        print("Keyboard interrupt received.")
+
+    finally:
+        print()
+        print("Cleaning up started processes...")
+
+        for process in reversed(processes):
+            process.stop()
+
+        print("Done.")
+
+
+if __name__ == "__main__":
+    main()
