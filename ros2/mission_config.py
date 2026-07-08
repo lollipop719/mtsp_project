@@ -15,17 +15,18 @@ WORKSPACE_SIZE_M: Final = 20.0
 DEFAULT_MISSION_SEED: Final = 20260707
 
 # Planner coordinates are 0–20 m. This controls their physical size in Gazebo.
-PLANNER_TO_GAZEBO_SCALE: Final = 0.50
+PLANNER_TO_GAZEBO_SCALE: Final = 0.80
 
 # Gazebo world frame is ENU: [east, north].
 GAZEBO_WORLD_OFFSET_ENU_M: Final = np.array(
-    [-5.0, -5.0],
+    [-8.0, -8.0],
     dtype=np.float64,
 )
 
 CRUISE_ALTITUDES_M: Final = (3.0, 4.0, 5.0)
 
-WAYPOINT_TOLERANCE_M: Final = 0.40
+WAYPOINT_TOLERANCE_M: Final = 0.25
+WAYPOINT_DWELL_S: Final = 1.50
 OFFBOARD_HEARTBEAT_HZ: Final = 10.0
 OFFBOARD_WARMUP_S: Final = 2.0
 

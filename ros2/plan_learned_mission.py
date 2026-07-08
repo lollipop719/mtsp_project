@@ -20,6 +20,8 @@ from ros2.mission_config import (
     NUM_TASKS,
     PROJECT_ROOT,
     WORKSPACE_SIZE_M,
+    PLANNER_TO_GAZEBO_SCALE,
+    GAZEBO_WORLD_OFFSET_ENU_M,
     planner_to_gazebo_enu,
     resolve_checkpoint_path,
 )
@@ -180,8 +182,8 @@ def main() -> None:
             },
         },
         "gazebo": {
-            "planner_to_gazebo_scale": 0.50,
-            "world_offset_enu_m": [-5.0, -5.0],
+            "planner_to_gazebo_scale": PLANNER_TO_GAZEBO_SCALE,
+            "world_offset_enu_m": GAZEBO_WORLD_OFFSET_ENU_M.tolist(),
             "depot_positions_enu_m": gazebo_depots.tolist(),
             "task_positions_enu_m": gazebo_tasks.tolist(),
         },

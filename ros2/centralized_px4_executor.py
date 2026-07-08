@@ -32,12 +32,17 @@ from ros2.mission_config import (
     OFFBOARD_WARMUP_S,
     PROJECT_ROOT,
     WAYPOINT_TOLERANCE_M,
+    WAYPOINT_DWELL_S,
     DroneSpec,
     home_hover_target,
     planner_delta_to_local_ned,
     planner_point_to_local_ned,
     planner_to_gazebo_enu,
 )
+
+from geometry_msgs.msg import Point
+from std_msgs.msg import ColorRGBA
+from visualization_msgs.msg import Marker, MarkerArray
 
 
 class MissionPhase(Enum):
@@ -71,6 +76,7 @@ class DroneRuntime:
     nav_state: int | None = None
 
     route_index: int = 0
+    arrival_started_at: float | None = None
     land_command_sent: bool = False
 
 
@@ -203,19 +209,33 @@ class CentralizedPX4Executor(Node):
         self,
         mission: Mission,
         waypoint_tolerance_m: float,
+        waypoint_dwell_s: float,
         mission_timeout_s: float,
+        hover_only: bool = False,
     ) -> None:
         super().__init__("centralized_px4_executor")
 
         self.mission = mission
         self.waypoint_tolerance_m = waypoint_tolerance_m
+        self.waypoint_dwell_s = waypoint_dwell_s
         self.mission_timeout_s = mission_timeout_s
+        self.hover_only = hover_only
 
         self.phase = MissionPhase.WAIT_FOR_TELEMETRY
         self.phase_started_at = time.monotonic()
 
+        # Set once after all drones provide valid telemetry.
+        # Unlike phase_started_at, this is never reset between phases.
+        self.mission_started_at: float | None = None
+
         self.warmup_ticks = 0
         self.last_mode_arm_request_at = -float("inf")
+
+        self.marker_publisher = self.create_publisher(
+            MarkerArray,
+            "/mtsp_visualization",
+            10,
+        )
 
         self.runtimes: dict[str, DroneRuntime] = {
             spec.name: DroneRuntime(
@@ -235,7 +255,7 @@ class CentralizedPX4Executor(Node):
         self.offboard_mode_publishers = {}
         self.trajectory_publishers = {}
         self.command_publishers = {}
-        self.subscriptions = []
+        self.px4_subscriptions = []
 
         for spec in DRONES:
             self.offboard_mode_publishers[spec.name] = (
@@ -262,7 +282,7 @@ class CentralizedPX4Executor(Node):
                 )
             )
 
-            self.subscriptions.append(
+            self.px4_subscriptions.append(
                 self.create_subscription(
                     VehicleLocalPosition,
                     f"{spec.namespace}/out/"
@@ -276,7 +296,7 @@ class CentralizedPX4Executor(Node):
                 )
             )
 
-            self.subscriptions.append(
+            self.px4_subscriptions.append(
                 self.create_subscription(
                     VehicleStatus,
                     f"{spec.namespace}/out/vehicle_status_v1",
@@ -298,6 +318,12 @@ class CentralizedPX4Executor(Node):
             "Executor created. Waiting for local-position "
             "telemetry from all three drones."
         )
+
+        if self.hover_only:
+            self.get_logger().warning(
+                "Hover-only mode enabled: drones will take off, "
+                "hover above their depots, then land."
+            )
 
     def timestamp_us(self) -> int:
         return int(
@@ -546,6 +572,8 @@ class CentralizedPX4Executor(Node):
             )
 
     def advance_routes(self) -> None:
+        now = time.monotonic()
+
         for runtime in self.runtimes.values():
             if runtime.land_command_sent:
                 continue
@@ -556,14 +584,39 @@ class CentralizedPX4Executor(Node):
                 runtime,
                 target,
             ):
+                runtime.arrival_started_at = None
                 continue
+
+            if runtime.arrival_started_at is None:
+                runtime.arrival_started_at = now
+
+                if runtime.route_index < len(runtime.route):
+                    task_id = runtime.route[runtime.route_index]
+                    self.get_logger().info(
+                        f"{runtime.spec.name} reached "
+                        f"Task {task_id + 1}; holding for "
+                        f"{self.waypoint_dwell_s:.1f} s."
+                    )
+                else:
+                    self.get_logger().info(
+                        f"{runtime.spec.name} reached depot hover point; "
+                        f"holding for {self.waypoint_dwell_s:.1f} s "
+                        "before landing."
+                    )
+
+                continue
+
+            if now - runtime.arrival_started_at < self.waypoint_dwell_s:
+                continue
+
+            runtime.arrival_started_at = None
 
             if runtime.route_index < len(runtime.route):
                 task_id = runtime.route[runtime.route_index]
 
                 self.get_logger().info(
-                    f"{runtime.spec.name} reached "
-                    f"Task {task_id + 1}."
+                    f"{runtime.spec.name} accepted "
+                    f"Task {task_id + 1} and is moving to next target."
                 )
 
                 runtime.route_index += 1
@@ -627,6 +680,13 @@ class CentralizedPX4Executor(Node):
 
         self.set_phase(MissionPhase.LANDING)
 
+    def drone_color(self, drone_index: int) -> tuple[float, float, float]:
+        if drone_index == 0:
+            return (1.0, 0.0, 0.0)  # red
+        if drone_index == 1:
+            return (0.0, 1.0, 0.0)  # green
+        return (0.0, 0.3, 1.0)      # blue
+    
     def tick(self) -> None:
         if self.phase == MissionPhase.DONE:
             return
@@ -634,17 +694,35 @@ class CentralizedPX4Executor(Node):
         if self.phase == MissionPhase.WAIT_FOR_TELEMETRY:
             if self.all_positions_ready():
                 self.capture_home_positions()
+
+                # The actual mission begins only after all home positions
+                # have been captured safely.
+                self.mission_started_at = time.monotonic()
+
                 self.set_phase(MissionPhase.WARMUP)
 
             return
 
-        elapsed = time.monotonic() - self.phase_started_at
+        if self.phase != MissionPhase.DONE:
+            self.publish_visualization()
+
+        mission_elapsed_s = 0.0
+
+        if self.mission_started_at is not None:
+            mission_elapsed_s = (
+                time.monotonic() - self.mission_started_at
+            )
 
         if (
             self.phase
             not in {MissionPhase.LANDING, MissionPhase.DONE}
-            and elapsed > self.mission_timeout_s
+            and mission_elapsed_s > self.mission_timeout_s
         ):
+            self.get_logger().error(
+                f"Mission exceeded {self.mission_timeout_s:.1f} seconds. "
+                "Landing all drones."
+            )
+
             self.emergency_land_all()
             return
 
@@ -669,12 +747,24 @@ class CentralizedPX4Executor(Node):
             self.request_offboard_and_arm()
 
             if self.all_drones_at_hover_target():
-                self.get_logger().info(
-                    "All drones reached cruise altitude. "
-                    "Starting route execution."
-                )
+                if self.hover_only:
+                    self.get_logger().info(
+                        "All drones reached cruise altitude. "
+                        "Hover-only test complete. Landing."
+                    )
 
-                self.set_phase(MissionPhase.EXECUTE)
+                    for runtime in self.runtimes.values():
+                        self.send_land_command(runtime)
+
+                    self.set_phase(MissionPhase.LANDING)
+
+                else:
+                    self.get_logger().info(
+                        "All drones reached cruise altitude. "
+                        "Starting route execution."
+                    )
+
+                    self.set_phase(MissionPhase.EXECUTE)
 
             return
 
@@ -700,6 +790,181 @@ class CentralizedPX4Executor(Node):
                 self.timer.cancel()
                 rclpy.shutdown()
 
+        
+
+    def publish_visualization(self) -> None:
+        marker_array = MarkerArray()
+        marker_id = 0
+
+        def make_color(r: float, g: float, b: float, a: float = 1.0) -> ColorRGBA:
+            color = ColorRGBA()
+            color.r = r
+            color.g = g
+            color.b = b
+            color.a = a
+            return color
+
+        def make_point(x: float, y: float, z: float) -> Point:
+            point = Point()
+            point.x = float(x)
+            point.y = float(y)
+            point.z = float(z)
+            return point
+
+        timestamp = self.get_clock().now().to_msg()
+
+        # -------------------------
+        # Collect task status
+        # -------------------------
+        completed_tasks = set()
+        current_targets = {}
+
+        for runtime in self.runtimes.values():
+            # completed tasks
+            for idx in range(runtime.route_index):
+                if idx < len(runtime.route):
+                    completed_tasks.add(runtime.route[idx])
+
+            # current task
+            if runtime.route_index < len(runtime.route):
+                current_targets[runtime.spec.name] = runtime.route[runtime.route_index]
+
+        # -------------------------
+        # Depot markers
+        # -------------------------
+        for drone_idx, spec in enumerate(DRONES):
+            depot_xy = planner_to_gazebo_enu(
+                self.mission.depots_xy[spec.depot_index]
+            )
+
+            r, g, b = self.drone_color(drone_idx)
+
+            marker = Marker()
+            marker.header.frame_id = "map"
+            marker.header.stamp = timestamp
+            marker.ns = "depots"
+            marker.id = marker_id
+            marker_id += 1
+            marker.type = Marker.CUBE
+            marker.action = Marker.ADD
+            marker.pose.position.x = float(depot_xy[0])
+            marker.pose.position.y = float(depot_xy[1])
+            marker.pose.position.z = 0.25
+            marker.pose.orientation.w = 1.0
+            marker.scale.x = 0.5
+            marker.scale.y = 0.5
+            marker.scale.z = 0.5
+            marker.color = make_color(r, g, b, 1.0)
+            marker_array.markers.append(marker)
+
+            text = Marker()
+            text.header.frame_id = "map"
+            text.header.stamp = timestamp
+            text.ns = "depot_labels"
+            text.id = marker_id
+            marker_id += 1
+            text.type = Marker.TEXT_VIEW_FACING
+            text.action = Marker.ADD
+            text.pose.position.x = float(depot_xy[0])
+            text.pose.position.y = float(depot_xy[1])
+            text.pose.position.z = 1.0
+            text.pose.orientation.w = 1.0
+            text.scale.z = 0.4
+            text.color = make_color(1.0, 1.0, 1.0, 1.0)
+            text.text = f"D{drone_idx + 1}"
+            marker_array.markers.append(text)
+
+        # -------------------------
+        # Task markers
+        # -------------------------
+        for task_id, task_xy_planner in enumerate(self.mission.tasks_xy):
+            task_xy = planner_to_gazebo_enu(task_xy_planner)
+
+            color = make_color(1.0, 1.0, 0.0, 1.0)  # default yellow
+            scale = 0.30
+
+            if task_id in completed_tasks:
+                color = make_color(0.4, 0.4, 0.4, 1.0)  # gray
+            else:
+                for drone_idx, spec in enumerate(DRONES):
+                    if (
+                        spec.name in current_targets
+                        and current_targets[spec.name] == task_id
+                    ):
+                        r, g, b = self.drone_color(drone_idx)
+                        color = make_color(r, g, b, 1.0)
+                        scale = 0.45
+                        break
+
+            marker = Marker()
+            marker.header.frame_id = "map"
+            marker.header.stamp = timestamp
+            marker.ns = "tasks"
+            marker.id = marker_id
+            marker_id += 1
+            marker.type = Marker.SPHERE
+            marker.action = Marker.ADD
+            marker.pose.position.x = float(task_xy[0])
+            marker.pose.position.y = float(task_xy[1])
+            marker.pose.position.z = 0.2
+            marker.pose.orientation.w = 1.0
+            marker.scale.x = scale
+            marker.scale.y = scale
+            marker.scale.z = scale
+            marker.color = color
+            marker_array.markers.append(marker)
+
+            text = Marker()
+            text.header.frame_id = "map"
+            text.header.stamp = timestamp
+            text.ns = "task_labels"
+            text.id = marker_id
+            marker_id += 1
+            text.type = Marker.TEXT_VIEW_FACING
+            text.action = Marker.ADD
+            text.pose.position.x = float(task_xy[0])
+            text.pose.position.y = float(task_xy[1])
+            text.pose.position.z = 0.75
+            text.pose.orientation.w = 1.0
+            text.scale.z = 0.25
+            text.color = make_color(1.0, 1.0, 1.0, 1.0)
+            text.text = f"T{task_id + 1}"
+            marker_array.markers.append(text)
+
+        # -------------------------
+        # Route lines
+        # -------------------------
+        for drone_idx, spec in enumerate(DRONES):
+            route = self.mission.routes[spec.depot_index]
+            depot_xy = planner_to_gazebo_enu(
+                self.mission.depots_xy[spec.depot_index]
+            )
+
+            line = Marker()
+            line.header.frame_id = "map"
+            line.header.stamp = timestamp
+            line.ns = "routes"
+            line.id = marker_id
+            marker_id += 1
+            line.type = Marker.LINE_STRIP
+            line.action = Marker.ADD
+            line.pose.orientation.w = 1.0
+            line.scale.x = 0.08
+
+            r, g, b = self.drone_color(drone_idx)
+            line.color = make_color(r, g, b, 1.0)
+
+            line.points.append(make_point(depot_xy[0], depot_xy[1], 0.1))
+
+            for task_id in route:
+                task_xy = planner_to_gazebo_enu(self.mission.tasks_xy[task_id])
+                line.points.append(make_point(task_xy[0], task_xy[1], 0.1))
+
+            line.points.append(make_point(depot_xy[0], depot_xy[1], 0.1))
+            marker_array.markers.append(line)
+
+        self.marker_publisher.publish(marker_array)
+
 
 def main() -> None:
     parser = argparse.ArgumentParser(
@@ -724,6 +989,13 @@ def main() -> None:
     )
 
     parser.add_argument(
+        "--waypoint-dwell-s",
+        type=float,
+        default=WAYPOINT_DWELL_S,
+        help="Seconds to hold after reaching each task/depot before advancing.",
+    )
+
+    parser.add_argument(
         "--mission-timeout-s",
         type=float,
         default=300.0,
@@ -739,6 +1011,13 @@ def main() -> None:
         "--execute",
         action="store_true",
         help="Arm the drones and run the mission.",
+    )
+
+    parser.add_argument(
+        "--hover-only",
+        action="store_true",
+        help="Only take off above each depot, then land. "
+        "Does not execute learned task routes.",
     )
 
     args = parser.parse_args()
@@ -760,7 +1039,9 @@ def main() -> None:
     node = CentralizedPX4Executor(
         mission=mission,
         waypoint_tolerance_m=args.waypoint_tolerance,
+        waypoint_dwell_s=args.waypoint_dwell_s,
         mission_timeout_s=args.mission_timeout_s,
+        hover_only=args.hover_only,
     )
 
     print_mission_preview(mission)
