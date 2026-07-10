@@ -1142,43 +1142,18 @@ class DANLivePX4Executor(Node):
     ) -> bool:
         now = self.now_s()
 
-        if hasattr(drone, "reached_started_s"):
-            attr = "reached_started_s"
-        elif hasattr(drone, "condition_started_s"):
-            attr = "condition_started_s"
-        else:
-            setattr(drone, "reached_started_s", None)
-            attr = "reached_started_s"
-
-        started = getattr(drone, attr, None)
-
         if not reached_now:
-            setattr(drone, attr, None)
+            drone.reached_started_s = None
             return False
 
-        if started is None:
-            setattr(drone, attr, now)
-            return False
+        if drone.reached_started_s is None:
+            drone.reached_started_s = now
 
-        return (now - started) >= self.args.waypoint_dwell_s
+        return (now - drone.reached_started_s) >= self.args.waypoint_dwell_s
 
 
     def control_tick(self) -> None:
         now = self.now_s()
-
-        def phase_is(drone: DroneRuntime, name: str) -> bool:
-            value = getattr(drone.phase, "value", drone.phase)
-            return value == name
-
-        def reset_dwell(drone: DroneRuntime) -> None:
-            if hasattr(drone, "reached_started_s"):
-                drone.reached_started_s = None
-            if hasattr(drone, "condition_started_s"):
-                drone.condition_started_s = None
-
-        def hold(drone: DroneRuntime, target_enu: np.ndarray, altitude_m: float) -> None:
-            self.publish_offboard_mode(drone)
-            self.publish_setpoint(drone, target_enu, altitude_m)
 
         if now - self.started_s > self.args.mission_timeout_s:
             self.get_logger().error("Mission timeout. Sending land commands.")
@@ -1187,16 +1162,10 @@ class DANLivePX4Executor(Node):
             rclpy.shutdown()
             return
 
-        routes_started = bool(
-            getattr(self, "_routes_started", False)
-            or getattr(self, "routing_started", False)
-        )
-
-        # Start DAN routing only after all drones completed serial takeoff.
-        if (not self.args.hover_only) and (not routes_started):
-            if all(phase_is(drone, "HOVER") for drone in self.drones):
+        # Moving mission: start DAN routing only after all drones completed sequential takeoff.
+        if (not self.args.hover_only) and (not getattr(self, "_routes_started", False)):
+            if all(drone.phase == "HOVER" for drone in self.drones):
                 self._routes_started = True
-                self.routing_started = True
                 self.get_logger().info(
                     "All drones reached staging HOVER. Starting DAN routing."
                 )
@@ -1210,45 +1179,21 @@ class DANLivePX4Executor(Node):
                 all_done = False
                 continue
 
-            routes_started = bool(
-                getattr(self, "_routes_started", False)
-                or getattr(self, "routing_started", False)
-            )
+            self.publish_offboard_mode(drone)
 
-            # Serial-control gate:
-            # before routing starts, only drones whose turn has arrived may receive
-            # offboard/setpoint streams. Future drones stay completely silent.
-            active_before_routing = (
-                drone.index < self.next_takeoff_index
-                or (
-                    drone.index == self.next_takeoff_index
-                    and now >= self.next_takeoff_allowed_s
-                )
-            )
-
-            if (
-                not routes_started
-                and not active_before_routing
-                and (
-                    phase_is(drone, "WAIT_FOR_TELEMETRY")
-                    or phase_is(drone, "WARMUP")
-                )
-            ):
-                all_done = False
-                continue
-
-            if phase_is(drone, "WAIT_FOR_TELEMETRY"):
+            if drone.phase == "WAIT_FOR_TELEMETRY":
                 self.set_phase(drone, "WARMUP")
 
-            if phase_is(drone, "WARMUP"):
-                hold(drone, drone.home_enu, drone.altitude_m)
+            if drone.phase == "WARMUP":
+                self.publish_setpoint(drone, drone.home_enu, drone.altitude_m)
 
                 warmup_done = now - drone.phase_started_s >= self.args.warmup_s
                 is_next_drone = drone.index == self.next_takeoff_index
+                interval_done = now >= self.next_takeoff_allowed_s
 
-                if warmup_done and is_next_drone:
+                if warmup_done and is_next_drone and interval_done:
                     self.get_logger().info(
-                        f"Serial control: starting Drone {drone.index + 1}"
+                        f"Sequential takeoff: starting Drone {drone.index + 1}"
                     )
                     self.arm_and_offboard(drone)
                     drone.last_arm_command_s = now
@@ -1257,9 +1202,10 @@ class DANLivePX4Executor(Node):
                 all_done = False
                 continue
 
-            if phase_is(drone, "TAKEOFF"):
-                hold(drone, drone.home_enu, drone.altitude_m)
+            if drone.phase == "TAKEOFF":
+                self.publish_setpoint(drone, drone.home_enu, drone.altitude_m)
 
+                # PX4 can miss/reject the first command. Retry while taking off.
                 if self.args.execute and (now - drone.last_arm_command_s) >= 1.0:
                     self.arm_and_offboard(drone)
                     drone.last_arm_command_s = now
@@ -1278,28 +1224,30 @@ class DANLivePX4Executor(Node):
 
                         if self.next_takeoff_index < self.num_agents:
                             self.get_logger().info(
-                                f"Serial control: Drone {drone.index + 1} is HOVER. "
-                                f"Drone {self.next_takeoff_index + 1} will start in "
+                                f"Sequential takeoff: Drone {drone.index + 1} is HOVER. "
+                                f"Drone {self.next_takeoff_index + 1} may start in "
                                 f"{self.takeoff_interval_s:.1f} s."
                             )
                         else:
                             self.get_logger().info(
-                                "Serial control: all drones have reached HOVER."
+                                "Sequential takeoff: all drones have reached HOVER."
                             )
 
                 all_done = False
                 continue
 
-            if phase_is(drone, "HOVER"):
-                hold(drone, drone.home_enu, drone.altitude_m)
+            if drone.phase == "HOVER":
+                self.publish_setpoint(drone, drone.home_enu, drone.altitude_m)
                 all_done = False
                 continue
 
-            if phase_is(drone, "ROUTE"):
+            if drone.phase == "ROUTE":
                 if drone.current_task_id is None:
                     assigned = self.assign_next_task(drone)
 
                     if not assigned:
+                        # No remaining tasks: send this drone back to its home/depot.
+                        # Some patched executor versions lost self.depot_unit, so recover it from the mission.
                         depot_unit = getattr(self, "depot_unit", None)
                         if depot_unit is None:
                             depot_unit = np.asarray(
@@ -1314,8 +1262,12 @@ class DANLivePX4Executor(Node):
                     else:
                         assert drone.current_target_enu is not None
 
-                if phase_is(drone, "ROUTE") and drone.current_target_enu is not None:
-                    hold(drone, drone.current_target_enu, drone.altitude_m)
+                if drone.phase == "ROUTE" and drone.current_target_enu is not None:
+                    self.publish_setpoint(
+                        drone,
+                        drone.current_target_enu,
+                        drone.altitude_m,
+                    )
 
                     reached = self.target_reached(
                         drone,
@@ -1331,13 +1283,13 @@ class DANLivePX4Executor(Node):
                         )
                         drone.current_task_id = None
                         drone.current_target_enu = None
-                        reset_dwell(drone)
+                        drone.reached_started_s = None
 
                 all_done = False
                 continue
 
-            if phase_is(drone, "RETURN"):
-                hold(drone, drone.home_enu, drone.altitude_m)
+            if drone.phase == "RETURN":
+                self.publish_setpoint(drone, drone.home_enu, drone.altitude_m)
 
                 reached = self.target_reached(
                     drone,
@@ -1354,24 +1306,23 @@ class DANLivePX4Executor(Node):
                 all_done = False
                 continue
 
-            if phase_is(drone, "LAND"):
-                if not getattr(drone, "landed_command_sent", False):
+            if drone.phase == "LAND":
+                if not drone.landed_command_sent:
                     self.land(drone)
                     drone.landed_command_sent = True
 
-                hold(drone, drone.home_enu, drone.altitude_m)
+                self.publish_setpoint(drone, drone.home_enu, drone.altitude_m)
                 all_done = False
                 continue
 
-            if not phase_is(drone, "DONE"):
+            if drone.phase != "DONE":
                 all_done = False
 
         if now - self.last_print_s >= 5.0:
             self.last_print_s = now
             claimed = int(np.sum(self.claimed_mask))
             phases = ", ".join(
-                f"D{drone.index + 1}:{getattr(drone.phase, 'value', drone.phase)}"
-                for drone in self.drones
+                f"D{drone.index + 1}:{drone.phase}" for drone in self.drones
             )
 
             telemetry = ", ".join(
@@ -1390,8 +1341,7 @@ class DANLivePX4Executor(Node):
             )
 
             if (not self.args.hover_only) and all(
-                phase_is(drone, "LAND") or phase_is(drone, "DONE")
-                for drone in self.drones
+                drone.phase in ("LAND", "DONE") for drone in self.drones
             ):
                 if not hasattr(self, "_all_returned_since_s"):
                     self._all_returned_since_s = now
