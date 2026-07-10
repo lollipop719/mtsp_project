@@ -316,6 +316,11 @@ def main() -> None:
     parser.add_argument("--execute", action="store_true")
     parser.add_argument("--hover-only", action="store_true")
     parser.add_argument("--spawn-visuals", action="store_true")
+    parser.add_argument(
+        "--dan-markers",
+        action="store_true",
+        help="Ask the DAN executor to spawn Gazebo task/depot/done markers internally.",
+    )
     parser.add_argument("--clean-start", action="store_true")
 
     parser.add_argument("--mission-timeout-s", type=float, default=300.0)
@@ -389,9 +394,9 @@ def main() -> None:
             processes.append(px4_process)
 
             if drone_index == 1:
-                time.sleep(8.0)
+                time.sleep(5.0)
             else:
-                time.sleep(4.0)
+                time.sleep(2.0)
 
         print()
         print(f"Waiting {args.startup_wait_s:.1f} s for PX4/Gazebo startup...")
@@ -451,6 +456,8 @@ def main() -> None:
 
         if args.hover_only:
             executor_command.append("--hover-only")
+        if getattr(args, "dan_markers", False):
+            executor_command.append("--spawn-markers")
 
         result = run_blocking(
             executor_command,

@@ -1,0 +1,758 @@
+from __future__ import annotations
+
+import argparse
+import json
+import math
+import sys
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Literal
+
+import numpy as np
+
+import torch
+
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(PROJECT_ROOT))
+
+import rclpy
+from rclpy.node import Node
+from rclpy.qos import (
+    QoSProfile,
+    ReliabilityPolicy,
+    HistoryPolicy,
+    DurabilityPolicy,
+)
+
+from px4_msgs.msg import (
+    OffboardControlMode,
+    TrajectorySetpoint,
+    VehicleCommand,
+    VehicleLocalPosition,
+    VehicleStatus,
+)
+
+from env.dan_async_mtsp_env import DANObservation
+from models.dan_mtsp import DANMTSPPolicy, DANPolicyRunner
+
+
+PLANNER_TO_GAZEBO_SCALE = 0.80
+GAZEBO_WORLD_OFFSET_ENU_M = np.asarray([-8.0, -8.0], dtype=np.float64)
+
+
+def planner_to_gazebo_enu(xy_planner: np.ndarray) -> np.ndarray:
+    return GAZEBO_WORLD_OFFSET_ENU_M + PLANNER_TO_GAZEBO_SCALE * xy_planner
+
+
+def gazebo_enu_to_planner(xy_enu: np.ndarray) -> np.ndarray:
+    return (xy_enu - GAZEBO_WORLD_OFFSET_ENU_M) / PLANNER_TO_GAZEBO_SCALE
+
+
+def load_world(path: Path) -> dict:
+    with path.open("r", encoding="utf-8") as file:
+        world = json.load(file)
+
+    if world.get("schema") != "dan_task_world_v1":
+        raise ValueError(f"Expected dan_task_world_v1, got {world.get('schema')}")
+
+    return world
+
+
+def load_dan_model(checkpoint_path: Path, device: torch.device) -> DANMTSPPolicy:
+    checkpoint = torch.load(
+        checkpoint_path,
+        map_location=device,
+        weights_only=False,
+    )
+
+    model = DANMTSPPolicy(
+        **checkpoint["model_config"],
+    ).to(device)
+
+    model.load_state_dict(checkpoint["state_dict"])
+    model.eval()
+
+    return model
+
+
+@dataclass
+class DroneRuntime:
+    index: int
+    namespace: str
+    target_system: int
+    home_enu: np.ndarray
+    altitude_m: float
+
+    local_position: VehicleLocalPosition | None = None
+    vehicle_status: VehicleStatus | None = None
+
+    phase: str = "WAIT_FOR_TELEMETRY"
+    phase_started_s: float = 0.0
+
+    current_task_id: int | None = None
+    current_target_enu: np.ndarray | None = None
+    reached_started_s: float | None = None
+
+    route_task_ids: list[int] = field(default_factory=list)
+    landed_command_sent: bool = False
+    last_arm_command_s: float = -1.0e9
+
+    def has_telemetry(self) -> bool:
+        # For offboard position control we only need local position.
+        # vehicle_status is useful for diagnostics, but waiting for it can make
+        # one drone get stuck in WAIT_FOR_TELEMETRY if that callback is delayed.
+        return self.local_position is not None
+
+
+class DANLivePX4Executor(Node):
+    def __init__(self, args: argparse.Namespace) -> None:
+        super().__init__("dan_live_px4_executor")
+
+        self.args = args
+        self.world = load_world(args.mission)
+
+        self.num_agents = int(self.world["num_agents"])
+        self.num_tasks = int(self.world["num_tasks"])
+        self.planner_size = float(
+            self.world.get("coordinate_frame", {}).get("planner_size", 20.0)
+        )
+
+        self.depot_unit = np.asarray(
+            self.world["depot_xy_unit"],
+            dtype=np.float64,
+        )
+
+        self.tasks_unit = np.asarray(
+            self.world["tasks_xy_unit"],
+            dtype=np.float64,
+        )
+
+        self.tasks_planner = np.asarray(
+            self.world["tasks_xy"],
+            dtype=np.float64,
+        )
+
+        depots_planner = np.asarray(
+            self.world["depots_xy"],
+            dtype=np.float64,
+        )
+
+        self.tasks_enu = np.stack(
+            [planner_to_gazebo_enu(xy) for xy in self.tasks_planner],
+            axis=0,
+        )
+
+        self.depot_enu = planner_to_gazebo_enu(
+            np.asarray(self.world["depot_xy_planner"], dtype=np.float64)
+        )
+
+        self.device = self._make_device(args.device)
+
+        self.model = load_dan_model(
+            checkpoint_path=args.checkpoint,
+            device=self.device,
+        )
+
+        self.policy = DANPolicyRunner(
+            model=self.model,
+            device=self.device,
+            mode=args.decode_mode,
+        )
+
+        self.claimed_mask = np.zeros(self.num_tasks, dtype=bool)
+
+        # This mirrors the training/offline environment:
+        # after an agent chooses a task, its model position becomes that task.
+        self.model_positions_unit = np.repeat(
+            self.depot_unit[None, :],
+            repeats=self.num_agents,
+            axis=0,
+        )
+
+        self.qos = QoSProfile(
+            reliability=ReliabilityPolicy.BEST_EFFORT,
+            durability=DurabilityPolicy.TRANSIENT_LOCAL,
+            history=HistoryPolicy.KEEP_LAST,
+            depth=1,
+        )
+
+        self.drones: list[DroneRuntime] = []
+        self.offboard_publishers = []
+        self.setpoint_publishers = []
+        self.command_publishers = []
+
+        for index in range(self.num_agents):
+            namespace = f"/px4_{index + 1}/fmu"
+            drone = DroneRuntime(
+                index=index,
+                namespace=namespace,
+                target_system=index + 2,
+                home_enu=planner_to_gazebo_enu(depots_planner[index]),
+                altitude_m=args.altitude_base + args.altitude_step * index,
+            )
+            self.drones.append(drone)
+
+            self.offboard_publishers.append(
+                self.create_publisher(
+                    OffboardControlMode,
+                    f"{namespace}/in/offboard_control_mode",
+                    self.qos,
+                )
+            )
+
+            self.setpoint_publishers.append(
+                self.create_publisher(
+                    TrajectorySetpoint,
+                    f"{namespace}/in/trajectory_setpoint",
+                    self.qos,
+                )
+            )
+
+            self.command_publishers.append(
+                self.create_publisher(
+                    VehicleCommand,
+                    f"{namespace}/in/vehicle_command",
+                    self.qos,
+                )
+            )
+
+            self.create_subscription(
+                VehicleLocalPosition,
+                f"{namespace}/out/vehicle_local_position_v1",
+                self._make_local_position_callback(index),
+                self.qos,
+            )
+
+            self.create_subscription(
+                VehicleStatus,
+                f"{namespace}/out/vehicle_status_v1",
+                self._make_vehicle_status_callback(index),
+                self.qos,
+            )
+
+        self.started_s = self.now_s()
+        self.last_print_s = self.started_s
+
+        self.get_logger().info(
+            f"Loaded DAN live world: agents={self.num_agents}, tasks={self.num_tasks}"
+        )
+        self.get_logger().info(f"Checkpoint: {args.checkpoint}")
+        self.get_logger().info(f"Decode mode: {args.decode_mode}")
+        self.get_logger().info(f"Device: {self.device}")
+
+
+        for drone in self.drones:
+            self.get_logger().info(
+                f"Drone {drone.index + 1}: home_enu={drone.home_enu.tolist()}, "
+                f"alt={drone.altitude_m:.1f}m, sysid={drone.target_system}"
+            )
+
+        self.timer = self.create_timer(
+            0.05,
+            self.control_tick,
+        )
+
+    def _make_device(self, text: str) -> torch.device:
+        if text == "auto":
+            return torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        return torch.device(text)
+
+    def _make_local_position_callback(self, index: int):
+        def callback(msg: VehicleLocalPosition) -> None:
+            self.drones[index].local_position = msg
+
+        return callback
+
+    def _make_vehicle_status_callback(self, index: int):
+        def callback(msg: VehicleStatus) -> None:
+            self.drones[index].vehicle_status = msg
+
+        return callback
+
+    def now_s(self) -> float:
+        return self.get_clock().now().nanoseconds * 1e-9
+
+    def timestamp_us(self) -> int:
+        return int(self.get_clock().now().nanoseconds / 1000)
+
+    def set_phase(self, drone: DroneRuntime, phase: str) -> None:
+        if drone.phase != phase:
+            drone.phase = phase
+            drone.phase_started_s = self.now_s()
+            drone.reached_started_s = None
+            self.get_logger().info(
+                f"Drone {drone.index + 1}: phase -> {phase}"
+            )
+
+    def drone_current_enu(self, drone: DroneRuntime) -> np.ndarray:
+        if drone.local_position is None:
+            return drone.home_enu.copy()
+
+        # PX4 local position is NED:
+        # x = north, y = east, z = down.
+        east = float(drone.local_position.y)
+        north = float(drone.local_position.x)
+
+        return drone.home_enu + np.asarray([east, north], dtype=np.float64)
+
+    def drone_current_altitude(self, drone: DroneRuntime) -> float:
+        if drone.local_position is None:
+            return 0.0
+        return -float(drone.local_position.z)
+
+    def enu_to_local_ned_setpoint(
+        self,
+        drone: DroneRuntime,
+        target_enu: np.ndarray,
+        altitude_m: float,
+    ) -> list[float]:
+        delta = target_enu - drone.home_enu
+        east = float(delta[0])
+        north = float(delta[1])
+        down = -float(altitude_m)
+        return [north, east, down]
+
+    def publish_offboard_mode(self, drone: DroneRuntime) -> None:
+        msg = OffboardControlMode()
+        msg.timestamp = self.timestamp_us()
+        msg.position = True
+        msg.velocity = False
+        msg.acceleration = False
+        msg.attitude = False
+        msg.body_rate = False
+        self.offboard_publishers[drone.index].publish(msg)
+
+    def publish_setpoint(
+        self,
+        drone: DroneRuntime,
+        target_enu: np.ndarray,
+        altitude_m: float,
+    ) -> None:
+        msg = TrajectorySetpoint()
+        msg.timestamp = self.timestamp_us()
+        msg.position = self.enu_to_local_ned_setpoint(
+            drone,
+            target_enu,
+            altitude_m,
+        )
+        msg.yaw = float("nan")
+        self.setpoint_publishers[drone.index].publish(msg)
+
+    def publish_vehicle_command(
+        self,
+        drone: DroneRuntime,
+        command: int,
+        *,
+        param1: float = 0.0,
+        param2: float = 0.0,
+    ) -> None:
+        if not self.args.execute:
+            return
+
+        msg = VehicleCommand()
+        msg.timestamp = self.timestamp_us()
+        msg.param1 = float(param1)
+        msg.param2 = float(param2)
+        msg.command = int(command)
+        msg.target_system = int(drone.target_system)
+        msg.target_component = 1
+        msg.source_system = 1
+        msg.source_component = 1
+        msg.from_external = True
+        self.command_publishers[drone.index].publish(msg)
+
+    def arm_and_offboard(self, drone: DroneRuntime) -> None:
+        self.publish_vehicle_command(
+            drone,
+            VehicleCommand.VEHICLE_CMD_DO_SET_MODE,
+            param1=1.0,
+            param2=6.0,
+        )
+        self.publish_vehicle_command(
+            drone,
+            VehicleCommand.VEHICLE_CMD_COMPONENT_ARM_DISARM,
+            param1=1.0,
+        )
+
+    def land(self, drone: DroneRuntime) -> None:
+        self.publish_vehicle_command(
+            drone,
+            VehicleCommand.VEHICLE_CMD_NAV_LAND,
+        )
+
+    def target_reached(
+        self,
+        drone: DroneRuntime,
+        target_enu: np.ndarray,
+        altitude_m: float,
+        tolerance_m: float,
+    ) -> bool:
+        if drone.local_position is None:
+            return False
+
+        current_enu = self.drone_current_enu(drone)
+        current_altitude = self.drone_current_altitude(drone)
+
+        horizontal_error = float(np.linalg.norm(current_enu - target_enu))
+        vertical_error = abs(current_altitude - altitude_m)
+
+        return math.sqrt(horizontal_error**2 + vertical_error**2) <= tolerance_m
+
+    def dwell_satisfied(
+        self,
+        drone: DroneRuntime,
+        reached_now: bool,
+    ) -> bool:
+        now = self.now_s()
+
+        if reached_now and drone.reached_started_s is None:
+            drone.reached_started_s = now
+
+        if drone.reached_started_s is None:
+            return False
+
+        return (now - drone.reached_started_s) >= self.args.waypoint_dwell_s
+
+    def remaining_distance_unit(self, drone: DroneRuntime) -> float:
+        if drone.current_task_id is None:
+            return 0.0
+
+        current_enu = self.drone_current_enu(drone)
+        current_planner = gazebo_enu_to_planner(current_enu)
+        current_unit = current_planner / self.planner_size
+
+        target_unit = self.tasks_unit[drone.current_task_id]
+
+        return float(np.linalg.norm(target_unit - current_unit))
+
+    def make_dan_observation(self, agent_id: int) -> DANObservation:
+        current_position = self.model_positions_unit[agent_id].copy()
+
+        cities_relative = (
+            self.tasks_unit - current_position[None, :]
+        ).astype(np.float64)
+
+        remaining = np.asarray(
+            [self.remaining_distance_unit(drone) for drone in self.drones],
+            dtype=np.float64,
+        )
+
+        agents_xy_relative = (
+            self.model_positions_unit - current_position[None, :]
+        ).astype(np.float64)
+
+        agents_relative = np.concatenate(
+            [agents_xy_relative, remaining[:, None]],
+            axis=1,
+        ).astype(np.float64)
+
+        action_mask = ~self.claimed_mask
+
+        return DANObservation(
+            deciding_agent=agent_id,
+            cities_relative=cities_relative,
+            agents_relative=agents_relative,
+            visited_mask=self.claimed_mask.copy(),
+            action_mask=action_mask.copy(),
+            current_position=current_position,
+            agent_positions=self.model_positions_unit.copy(),
+            remaining_travel_times=remaining.copy(),
+        )
+
+    def assign_next_task(self, drone: DroneRuntime) -> bool:
+        if bool(np.all(self.claimed_mask)):
+            return False
+
+        observation = self.make_dan_observation(drone.index)
+
+        if not np.any(observation.action_mask):
+            return False
+
+        with torch.no_grad():
+            output = self.policy(observation)
+
+        task_id = int(output.action)
+
+        if self.claimed_mask[task_id]:
+            valid = np.flatnonzero(~self.claimed_mask).tolist()
+            self.get_logger().error(
+                f"DAN selected already-claimed task {task_id + 1}; valid={valid}"
+            )
+            return False
+
+        self.claimed_mask[task_id] = True
+        drone.current_task_id = task_id
+        drone.current_target_enu = self.tasks_enu[task_id].copy()
+        drone.route_task_ids.append(task_id)
+        drone.reached_started_s = None
+
+        # Match training/offline DAN: selected target becomes this agent's model position.
+        self.model_positions_unit[drone.index] = self.tasks_unit[task_id]
+
+        self.get_logger().info(
+            f"Drone {drone.index + 1}: assigned Task {task_id + 1} "
+            f"({int(np.sum(self.claimed_mask))}/{self.num_tasks})"
+        )
+
+        return True
+
+    def control_tick(self) -> None:
+        now = self.now_s()
+
+        if now - self.started_s > self.args.mission_timeout_s:
+            self.get_logger().error("Mission timeout. Sending land commands.")
+            for drone in self.drones:
+                self.land(drone)
+            rclpy.shutdown()
+            return
+
+        all_done = True
+
+        for drone in self.drones:
+            if not drone.has_telemetry():
+                all_done = False
+                continue
+
+            self.publish_offboard_mode(drone)
+
+            if drone.phase == "WAIT_FOR_TELEMETRY":
+                self.set_phase(drone, "WARMUP")
+
+            if drone.phase == "WARMUP":
+                self.publish_setpoint(drone, drone.home_enu, drone.altitude_m)
+
+                if now - drone.phase_started_s >= self.args.warmup_s:
+                    self.arm_and_offboard(drone)
+                    drone.last_arm_command_s = now
+                    self.set_phase(drone, "TAKEOFF")
+
+                all_done = False
+                continue
+
+            if drone.phase == "TAKEOFF":
+                self.publish_setpoint(drone, drone.home_enu, drone.altitude_m)
+
+                # PX4 can occasionally miss/reject the first arm/offboard command
+                # if it is not fully ready yet. Keep retrying during TAKEOFF.
+                if self.args.execute and (now - drone.last_arm_command_s) >= 1.0:
+                    self.arm_and_offboard(drone)
+                    drone.last_arm_command_s = now
+
+                # During takeoff, judging with full 3D distance can be too strict:
+                # small XY drift can prevent the phase from advancing even though
+                # the drone is already airborne and stable. Use altitude-based
+                # completion for takeoff.
+                current_altitude = self.drone_current_altitude(drone)
+                reached = current_altitude >= (drone.altitude_m - self.args.takeoff_altitude_tolerance)
+
+                if self.dwell_satisfied(drone, reached):
+                    # Always go to staging HOVER first.
+                    # For moving missions, routing starts only after all drones are ready.
+                    self.set_phase(drone, "HOVER")
+
+                all_done = False
+                continue
+
+            if drone.phase == "HOVER":
+                self.publish_setpoint(drone, drone.home_enu, drone.altitude_m)
+                all_done = False
+                continue
+
+            if drone.phase == "ROUTE":
+                if drone.current_task_id is None:
+                    assigned = self.assign_next_task(drone)
+
+                    if not assigned:
+                        self.model_positions_unit[drone.index] = self.depot_unit
+                        drone.current_target_enu = drone.home_enu.copy()
+                        self.set_phase(drone, "RETURN")
+                    else:
+                        assert drone.current_target_enu is not None
+
+                if drone.phase == "ROUTE" and drone.current_target_enu is not None:
+                    self.publish_setpoint(
+                        drone,
+                        drone.current_target_enu,
+                        drone.altitude_m,
+                    )
+
+                    reached = self.target_reached(
+                        drone,
+                        drone.current_target_enu,
+                        drone.altitude_m,
+                        self.args.waypoint_tolerance,
+                    )
+
+                    if self.dwell_satisfied(drone, reached):
+                        assert drone.current_task_id is not None
+                        self.get_logger().info(
+                            f"Drone {drone.index + 1}: reached Task {drone.current_task_id + 1}"
+                        )
+                        drone.current_task_id = None
+                        drone.current_target_enu = None
+                        drone.reached_started_s = None
+
+                all_done = False
+                continue
+
+            if drone.phase == "RETURN":
+                self.publish_setpoint(drone, drone.home_enu, drone.altitude_m)
+
+                reached = self.target_reached(
+                    drone,
+                    drone.home_enu,
+                    drone.altitude_m,
+                    self.args.waypoint_tolerance,
+                )
+
+                if self.dwell_satisfied(drone, reached):
+                    self.land(drone)
+                    drone.landed_command_sent = True
+                    self.set_phase(drone, "LAND")
+
+                all_done = False
+                continue
+
+            if drone.phase == "LAND":
+                if not drone.landed_command_sent:
+                    self.land(drone)
+                    drone.landed_command_sent = True
+
+                # Keep sending a low setpoint while PX4 lands.
+                self.publish_setpoint(drone, drone.home_enu, drone.altitude_m)
+
+                all_done = False
+                continue
+
+            if drone.phase != "DONE":
+                all_done = False
+
+        if now - self.last_print_s >= 5.0:
+            self.last_print_s = now
+            claimed = int(np.sum(self.claimed_mask))
+            phases = ", ".join(
+                f"D{drone.index + 1}:{drone.phase}" for drone in self.drones
+            )
+
+            telemetry = ", ".join(
+                (
+                    f"D{drone.index + 1}:"
+                    f"lp={'Y' if drone.local_position is not None else 'N'}"
+                    f"/st={'Y' if drone.vehicle_status is not None else 'N'}"
+                    f"/alt={self.drone_current_altitude(drone):.2f}"
+                    f"/tgt={drone.altitude_m:.2f}"
+                )
+                for drone in self.drones
+            )
+
+            self.get_logger().info(
+                f"Progress: claimed {claimed}/{self.num_tasks} | {phases} | {telemetry}"
+            )
+
+            # For non-hover missions, wait until all drones have completed takeoff.
+            # This avoids starting route control while another drone is still taking off.
+            if (not self.args.hover_only) and (not getattr(self, "_routes_started", False)):
+                if all(drone.phase == "HOVER" for drone in self.drones):
+                    self._routes_started = True
+                    self.get_logger().info(
+                        "All drones reached staging HOVER. Starting DAN routing."
+                    )
+                    for drone in self.drones:
+                        self.set_phase(drone, "ROUTE")
+
+            # End the live mission automatically after all drones have returned
+            # and entered LAND/DONE. This prevents the executor from running forever.
+            if (not self.args.hover_only) and all(
+                drone.phase in ("LAND", "DONE") for drone in self.drones
+            ):
+                if not hasattr(self, "_all_returned_since_s"):
+                    self._all_returned_since_s = now
+                    self.get_logger().info(
+                        "All drones are in LAND/DONE. Waiting before shutdown..."
+                    )
+                elif now - self._all_returned_since_s >= self.args.finish_after_return_s:
+                    self.get_logger().info("Mission complete. Shutting down executor.")
+                    rclpy.shutdown()
+                    return
+            else:
+                if hasattr(self, "_all_returned_since_s"):
+                    delattr(self, "_all_returned_since_s")
+
+        if all_done:
+            self.print_summary()
+            rclpy.shutdown()
+
+    def print_summary(self) -> None:
+        self.get_logger().info("DAN live PX4 mission summary")
+        for drone in self.drones:
+            readable = [task_id + 1 for task_id in drone.route_task_ids]
+            self.get_logger().info(
+                f"Drone {drone.index + 1}: tasks={readable}"
+            )
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Live DAN asynchronous PX4 executor."
+    )
+
+    parser.add_argument("--mission", type=Path, required=True)
+    parser.add_argument(
+        "--checkpoint",
+        type=Path,
+        default=Path("checkpoints/dan_refine_2to5_agents_15to25_tasks/dan_best.pt"),
+    )
+
+    parser.add_argument("--execute", action="store_true")
+    parser.add_argument("--hover-only", action="store_true")
+
+    parser.add_argument(
+        "--decode-mode",
+        choices=["greedy", "sample"],
+        default="greedy",
+    )
+
+    parser.add_argument(
+        "--device",
+        choices=["auto", "cuda", "cpu"],
+        default="auto",
+    )
+
+    parser.add_argument("--mission-timeout-s", type=float, default=300.0)
+    parser.add_argument("--finish-after-return-s", type=float, default=8.0,
+                        help="After all drones enter LAND/DONE, wait this many seconds then exit.")
+    parser.add_argument("--waypoint-tolerance", type=float, default=0.45)
+    parser.add_argument(
+        "--takeoff-altitude-tolerance",
+        type=float,
+        default=1.2,
+        help="Takeoff is considered complete once altitude >= target - tolerance.",
+    )
+    parser.add_argument("--waypoint-dwell-s", type=float, default=1.5)
+    parser.add_argument("--warmup-s", type=float, default=4.0)
+
+    parser.add_argument("--altitude-base", type=float, default=3.0)
+    parser.add_argument("--altitude-step", type=float, default=0.4)
+
+    return parser.parse_args()
+
+
+def main() -> None:
+    args = parse_args()
+
+    rclpy.init()
+    node = DANLivePX4Executor(args)
+
+    try:
+        rclpy.spin(node)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        node.destroy_node()
+
+        if rclpy.ok():
+            rclpy.shutdown()
+
+
+if __name__ == "__main__":
+    main()

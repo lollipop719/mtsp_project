@@ -389,9 +389,9 @@ def main() -> None:
             processes.append(px4_process)
 
             if drone_index == 1:
-                time.sleep(8.0)
+                time.sleep(5.0)
             else:
-                time.sleep(4.0)
+                time.sleep(2.0)
 
         print()
         print(f"Waiting {args.startup_wait_s:.1f} s for PX4/Gazebo startup...")
