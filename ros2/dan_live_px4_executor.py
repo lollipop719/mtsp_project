@@ -1484,8 +1484,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--altitude-step",
         type=float,
-        default=0.35,
-        help="Per-drone altitude separation. Keep <= 0.4 for five drones.",
+        default=0.8,
+        help="Per-drone altitude separation. Keep <= 0.8 for five drones.",
     )
 
     parser.add_argument("--land-retry-s", type=float, default=1.0)
@@ -1509,8 +1509,8 @@ def parse_args() -> argparse.Namespace:
 
     args = parser.parse_args()
 
-    if args.altitude_step > 0.4:
-        parser.error("--altitude-step should be <= 0.4 for reliable takeoff")
+    if args.altitude_step > 0.8:
+        parser.error("--altitude-step should be <= 0.8 for reliable takeoff")
     if args.altitude_base <= 0.0:
         parser.error("--altitude-base must be positive")
     if args.warmup_s < 1.0:
