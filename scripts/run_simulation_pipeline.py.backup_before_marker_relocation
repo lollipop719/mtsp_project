@@ -374,15 +374,6 @@ def main() -> None:
     parser.add_argument("--waypoint-tolerance", type=float, default=0.25)
     parser.add_argument("--waypoint-dwell-s", type=float, default=1.5)
     parser.add_argument("--startup-wait-s", type=float, default=25.0)
-    parser.add_argument(
-        "--pre-static-markers-wait-s",
-        type=float,
-        default=5.0,
-        help=(
-            "Wait after all PX4 local-position topics are available "
-            "before inserting the Gazebo markers."
-        ),
-    )
     parser.add_argument("--post-visuals-wait-s", type=float, default=5.0)
 
     parser.add_argument(
@@ -448,6 +439,46 @@ def main() -> None:
 
             px4_process.start()
             processes.append(px4_process)
+
+            # Static task marker stage: Gazebo is ready before remaining PX4 instances.
+            # PX4 instance 1 launches Gazebo, so task visuals are inserted here once.
+            if drone_index == 1 and args.static_task_markers:
+                print()
+                print(
+                    "Waiting for Gazebo before spawning static task markers..."
+                )
+
+                if not wait_for_gazebo_create_service(timeout_s=60.0):
+                    raise RuntimeError(
+                        "Gazebo create service did not appear. "
+                        "Static task markers cannot be spawned."
+                    )
+
+                # Give PX4's first Gazebo model a moment to finish loading.
+                time.sleep(3.0)
+
+                marker_result = run_blocking(
+                    [
+                        sys.executable,
+                        "-m",
+                        "ros2.spawn_static_task_markers",
+                        "--mission",
+                        str(mission_path),
+                    ],
+                    cwd=PROJECT_ROOT,
+                )
+
+                if marker_result != 0:
+                    raise RuntimeError(
+                        "Static Gazebo task-marker spawning failed."
+                    )
+
+                print(
+                    f"Waiting {args.post_static_markers_wait_s:.1f} s "
+                    "before starting the remaining PX4 instances..."
+                )
+                time.sleep(args.post_static_markers_wait_s)
+
             # Serial PX4 startup:
             # wait for this vehicle's local-position bridge before spawning the next.
             wait_for_one_px4_local_position_topic(
@@ -498,57 +529,6 @@ def main() -> None:
                 time.sleep(args.post_visuals_wait_s)
             else:
                 print("Gazebo create service was not detected. Skipping visuals.")
-
-        # Static task markers: all PX4 instances are ready; executor has not started yet.
-        if args.static_task_markers:
-            print()
-            print(
-                "Reconfirming all PX4 local-position topics "
-                "before spawning static task markers..."
-            )
-
-            if not wait_for_px4_ros_topics(
-                num_drones=num_drones,
-                timeout_s=30.0,
-            ):
-                raise RuntimeError(
-                    "PX4 telemetry disappeared before marker insertion."
-                )
-
-            print(
-                f"Waiting {args.pre_static_markers_wait_s:.1f} s "
-                "for PX4 and Gazebo to settle..."
-            )
-            time.sleep(args.pre_static_markers_wait_s)
-
-            print("Waiting for Gazebo create service...")
-
-            if not wait_for_gazebo_create_service(timeout_s=30.0):
-                raise RuntimeError(
-                    "Gazebo create service was not detected."
-                )
-
-            marker_result = run_blocking(
-                [
-                    sys.executable,
-                    "-m",
-                    "ros2.spawn_static_task_markers",
-                    "--mission",
-                    str(mission_path),
-                ],
-                cwd=PROJECT_ROOT,
-            )
-
-            if marker_result != 0:
-                raise RuntimeError(
-                    "Static Gazebo task-marker spawning failed."
-                )
-
-            print(
-                f"Waiting {args.post_static_markers_wait_s:.1f} s "
-                "after marker insertion before starting the executor..."
-            )
-            time.sleep(args.post_static_markers_wait_s)
 
         executor_command = [
             sys.executable,
