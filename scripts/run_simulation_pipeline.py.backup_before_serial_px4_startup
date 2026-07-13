@@ -302,44 +302,6 @@ def wait_for_px4_ros_topics(
     return False
 
 
-def wait_for_one_px4_local_position_topic(
-    drone_index: int,
-    timeout_s: float = 90.0,
-    poll_s: float = 1.0,
-) -> None:
-    """Wait until one PX4 instance exposes its local-position ROS 2 topic."""
-    topic = f"/px4_{drone_index}/fmu/out/vehicle_local_position_v1"
-    deadline = time.time() + timeout_s
-
-    print(f"Waiting for {topic} ...")
-
-    last_error = ""
-    while time.time() < deadline:
-        try:
-            result = subprocess.run(
-                ["ros2", "topic", "list"],
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True,
-                check=False,
-            )
-            if result.returncode == 0:
-                topics = set(line.strip() for line in result.stdout.splitlines())
-                if topic in topics:
-                    print(f"Detected {topic}")
-                    return
-            else:
-                last_error = result.stderr.strip()
-        except Exception as exc:
-            last_error = str(exc)
-
-        time.sleep(poll_s)
-
-    raise RuntimeError(
-        f"Timed out waiting for {topic}. Last ros2 topic list error: {last_error}"
-    )
-
-
 def main() -> None:
     parser = argparse.ArgumentParser(
         description="Run a variable-drone mTSP Gazebo pipeline."
@@ -426,17 +388,10 @@ def main() -> None:
             px4_process.start()
             processes.append(px4_process)
 
-            # Serial PX4 startup:
-            # wait for this vehicle's local-position bridge before spawning the next.
-            wait_for_one_px4_local_position_topic(
-                drone_index,
-                timeout_s=90.0,
-                poll_s=1.0,
-            )
-
-            if drone_index < num_drones:
-                print("Serial PX4 startup: waiting 10.0 s before next PX4 instance...")
-                time.sleep(10.0)
+            if drone_index == 1:
+                time.sleep(8.0)
+            else:
+                time.sleep(4.0)
 
         print()
         print(f"Waiting {args.startup_wait_s:.1f} s for PX4/Gazebo startup...")
